@@ -1629,6 +1629,35 @@ class ClawHubSource(SkillSource):
         _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in final_results])
         return final_results
 
+    def _resolve_version_integrity(
+        self, slug: str, version: str
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Return (sha256hash_hex, version_data) from the version metadata API.
+
+        sha256hash_hex is the expected archive-level SHA-256 (hex, 64 chars) for
+        archive-integrity verification.  version_data is the raw response dict,
+        used as a fallback source for per-file hashes via _extract_files().
+        Both may be None when the API returns no usable integrity information.
+        """
+        version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{version}")
+        if not isinstance(version_data, dict):
+            return None, None
+
+        # The hash may live at the top level or under a nested "version" key
+        for candidate in (version_data, version_data.get("version", {})):
+            if not isinstance(candidate, dict):
+                continue
+            raw_hash = candidate.get("sha256hash")
+            if isinstance(raw_hash, str):
+                raw_hash = raw_hash.strip()
+                # Accept both plain hex and "sha256:<hex>" prefixed forms
+                if raw_hash.startswith("sha256:"):
+                    raw_hash = raw_hash[len("sha256:"):]
+                if len(raw_hash) == 64 and all(c in "0123456789abcdefABCDEF" for c in raw_hash):
+                    return raw_hash.lower(), version_data
+
+        return None, version_data
+
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         slug = identifier.split("/")[-1]
 
@@ -1641,19 +1670,35 @@ class ClawHubSource(SkillSource):
             logger.warning("ClawHub fetch failed for %s: could not resolve latest version", slug)
             return None
 
-        # Primary method: download the skill as a ZIP bundle from /download
-        files = self._download_zip(slug, latest_version)
+        # Fetch version metadata to obtain the expected archive SHA-256 before downloading.
+        # This mirrors OpenClaw's approach: resolve integrity metadata first, then verify
+        # the downloaded archive against the server-published hash (fail-closed).
+        expected_sha256, version_data = self._resolve_version_integrity(slug, latest_version)
 
-        # Fallback: try the version metadata endpoint for inline/raw content
-        if "SKILL.md" not in files:
-            version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
-            if isinstance(version_data, dict):
-                # Files may be nested under version_data["version"]["files"]
+        # Primary method: download the skill as a ZIP bundle from /download.
+        # _download_zip enforces the archive-level integrity check and raises
+        # ValueError if expected_sha256 is absent or the digest does not match.
+        try:
+            files = self._download_zip(slug, latest_version, expected_sha256=expected_sha256)
+        except ValueError as exc:
+            logger.warning("ClawHub integrity check failed for %s@%s: %s", slug, latest_version, exc)
+            return None
+
+        # Fallback: try per-file content from the version metadata endpoint.
+        # _extract_files verifies each file's SHA-256 when the API provides it.
+        if "SKILL.md" not in files and isinstance(version_data, dict):
+            try:
                 files = self._extract_files(version_data) or files
                 if "SKILL.md" not in files:
                     nested = version_data.get("version", {})
                     if isinstance(nested, dict):
                         files = self._extract_files(nested) or files
+            except ValueError as exc:
+                logger.warning(
+                    "ClawHub per-file integrity check failed for %s@%s: %s",
+                    slug, latest_version, exc,
+                )
+                return None
 
         if "SKILL.md" not in files:
             logger.warning(
@@ -1803,23 +1848,76 @@ class ClawHubSource(SkillSource):
             if not fname or not isinstance(fname, str):
                 continue
 
+            # Per-file expected SHA-256 from version metadata (hex, 64 chars)
+            expected_sha256 = file_meta.get("sha256")
+            if isinstance(expected_sha256, str):
+                expected_sha256 = expected_sha256.strip() or None
+            else:
+                expected_sha256 = None
+
             inline_content = file_meta.get("content")
             if isinstance(inline_content, str):
+                if expected_sha256:
+                    actual = hashlib.sha256(inline_content.encode("utf-8")).hexdigest()
+                    if actual != expected_sha256:
+                        raise ValueError(
+                            f"Per-file integrity mismatch for '{fname}': "
+                            f"expected {expected_sha256}, got {actual}"
+                        )
+                else:
+                    logger.debug(
+                        "No sha256 in version metadata for file '%s', skipping per-file check.", fname
+                    )
                 files[fname] = inline_content
                 continue
 
             raw_url = file_meta.get("rawUrl") or file_meta.get("downloadUrl") or file_meta.get("url")
             if isinstance(raw_url, str) and raw_url.startswith("http"):
-                content = self._fetch_text(raw_url)
-                if content is not None:
-                    files[fname] = content
+                raw_bytes = self._fetch_bytes(raw_url)
+                if raw_bytes is not None:
+                    if expected_sha256:
+                        actual = hashlib.sha256(raw_bytes).hexdigest()
+                        if actual != expected_sha256:
+                            raise ValueError(
+                                f"Per-file integrity mismatch for '{fname}': "
+                                f"expected {expected_sha256}, got {actual}"
+                            )
+                    else:
+                        logger.debug(
+                            "No sha256 in version metadata for file '%s', skipping per-file check.", fname
+                        )
+                    try:
+                        files[fname] = raw_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        logger.debug("Skipping non-text file in version metadata: %s", fname)
 
         return files
 
-    def _download_zip(self, slug: str, version: str) -> Dict[str, str]:
-        """Download skill as a ZIP bundle from the /download endpoint and extract text files."""
+    def _download_zip(
+        self,
+        slug: str,
+        version: str,
+        expected_sha256: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """Download skill as a ZIP bundle from the /download endpoint and extract text files.
+
+        If *expected_sha256* is provided (hex-encoded SHA-256 of the archive bytes, as
+        returned by the version metadata API), the downloaded archive is verified before
+        extraction and a mismatch raises ValueError.
+
+        If *expected_sha256* is None (the version API did not publish a hash), the
+        download proceeds but a warning is logged — this is a degraded mode that remains
+        vulnerable to MITM until the upstream API starts publishing integrity metadata.
+        """
         import io
         import zipfile
+
+        if expected_sha256 is None:
+            logger.warning(
+                "ClawHub did not provide a sha256hash for %s@%s. "
+                "Installing without archive integrity verification.",
+                slug, version,
+            )
 
         files: Dict[str, str] = {}
         max_retries = 3
@@ -1847,7 +1945,18 @@ class ClawHubSource(SkillSource):
                     logger.debug("ClawHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
                     return files
 
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                content = resp.content
+
+                # Archive-level integrity check: only enforced when the API provides a hash.
+                if expected_sha256 is not None:
+                    actual_sha256 = hashlib.sha256(content).hexdigest()
+                    if actual_sha256 != expected_sha256:
+                        raise ValueError(
+                            f"Archive integrity mismatch for {slug}@{version}: "
+                            f"expected sha256:{expected_sha256}, got sha256:{actual_sha256}"
+                        )
+
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
@@ -1879,14 +1988,23 @@ class ClawHubSource(SkillSource):
         logger.debug("ClawHub ZIP download exhausted retries for %s v%s", slug, version)
         return files
 
-    def _fetch_text(self, url: str) -> Optional[str]:
+    def _fetch_bytes(self, url: str) -> Optional[bytes]:
         try:
             resp = httpx.get(url, timeout=20)
             if resp.status_code == 200:
-                return resp.text
+                return resp.content
         except httpx.HTTPError:
             return None
         return None
+
+    def _fetch_text(self, url: str) -> Optional[str]:
+        raw = self._fetch_bytes(url)
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -2630,8 +2748,12 @@ def bundle_content_hash(bundle: SkillBundle) -> str:
     """Compute a deterministic hash for an in-memory skill bundle."""
     h = hashlib.sha256()
     for rel_path in sorted(bundle.files):
+        # Include the path so that renaming a file changes the digest
+        h.update(rel_path.encode("utf-8"))
+        h.update(b"\n")
         h.update(bundle.files[rel_path].encode("utf-8"))
-    return f"sha256:{h.hexdigest()[:16]}"
+        h.update(b"\n")
+    return f"sha256:{h.hexdigest()}"
 
 
 def _source_matches(source: SkillSource, source_name: str) -> bool:
