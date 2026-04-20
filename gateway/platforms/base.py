@@ -850,6 +850,34 @@ def resolve_channel_prompt(
             return prompt
     return None
 
+# ---------------------------------------------------------------------------
+# Media path authorization
+#
+# ``extract_local_files`` scans the agent's response text for local paths and
+# passes them to the platform adapter for delivery.  Without a boundary check
+# an attacker who can influence the LLM's output (prompt injection) could cause
+# the gateway to read and upload arbitrary host files.
+#
+# Only paths inside the known Hermes cache directories are allowed — these are
+# the files written during normal platform operation (received images, audio,
+# documents, and browser screenshots).
+# ---------------------------------------------------------------------------
+
+_AUTHORIZED_MEDIA_DIRS = (
+    IMAGE_CACHE_DIR.resolve(),
+    AUDIO_CACHE_DIR.resolve(),
+    DOCUMENT_CACHE_DIR.resolve(),
+    get_hermes_dir("cache/screenshots", "browser_screenshots").resolve(),
+)
+
+
+def _is_authorized_media_path(path: str) -> bool:
+    """Return True if *path* is inside an authorized Hermes cache directory."""
+    try:
+        resolved = Path(path).resolve()
+        return any(resolved.is_relative_to(d) for d in _AUTHORIZED_MEDIA_DIRS)
+    except (ValueError, OSError):
+        return False
 
 class BasePlatformAdapter(ABC):
     """
@@ -1382,7 +1410,7 @@ class BasePlatformAdapter(ABC):
                 continue
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
-            if os.path.isfile(expanded):
+            if os.path.isfile(expanded) and _is_authorized_media_path(expanded):
                 found.append((raw, expanded))
 
         # Deduplicate by expanded path, preserving discovery order
