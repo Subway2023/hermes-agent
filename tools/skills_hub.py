@@ -1629,6 +1629,22 @@ class ClawHubSource(SkillSource):
         _write_index_cache(cache_key, [_skill_meta_to_dict(s) for s in final_results])
         return final_results
 
+    def _resolve_version_integrity(
+        self, slug: str, version: str
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{version}")
+        if not isinstance(version_data, dict):
+            return None, None
+        expected_sha256 = version_data.get("sha256hash")
+        if not isinstance(expected_sha256, str) or not expected_sha256:
+            logger.warning(
+                "ClawHub: no sha256hash for %s v%s — proceeding without archive integrity check",
+                slug,
+                version,
+            )
+            expected_sha256 = None
+        return expected_sha256, version_data
+
     def fetch(self, identifier: str) -> Optional[SkillBundle]:
         slug = identifier.split("/")[-1]
 
@@ -1641,12 +1657,19 @@ class ClawHubSource(SkillSource):
             logger.warning("ClawHub fetch failed for %s: could not resolve latest version", slug)
             return None
 
+        expected_sha256, version_data = self._resolve_version_integrity(slug, latest_version)
+
         # Primary method: download the skill as a ZIP bundle from /download
-        files = self._download_zip(slug, latest_version)
+        try:
+            files = self._download_zip(slug, latest_version, expected_sha256=expected_sha256)
+        except ValueError as exc:
+            logger.error("ClawHub fetch aborted for %s: %s", slug, exc)
+            return None
 
         # Fallback: try the version metadata endpoint for inline/raw content
         if "SKILL.md" not in files:
-            version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
+            if version_data is None:
+                version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
             if isinstance(version_data, dict):
                 # Files may be nested under version_data["version"]["files"]
                 files = self._extract_files(version_data) or files
@@ -1810,13 +1833,24 @@ class ClawHubSource(SkillSource):
 
             raw_url = file_meta.get("rawUrl") or file_meta.get("downloadUrl") or file_meta.get("url")
             if isinstance(raw_url, str) and raw_url.startswith("http"):
+                expected_file_sha256 = file_meta.get("sha256")
                 content = self._fetch_text(raw_url)
                 if content is not None:
+                    if isinstance(expected_file_sha256, str) and expected_file_sha256:
+                        actual = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                        if actual != expected_file_sha256:
+                            logger.warning(
+                                "File integrity check failed for %s: expected %s, got %s — skipping",
+                                fname,
+                                expected_file_sha256,
+                                actual,
+                            )
+                            continue
                     files[fname] = content
 
         return files
 
-    def _download_zip(self, slug: str, version: str) -> Dict[str, str]:
+    def _download_zip(self, slug: str, version: str, *, expected_sha256: Optional[str] = None) -> Dict[str, str]:
         """Download skill as a ZIP bundle from the /download endpoint and extract text files."""
         import io
         import zipfile
@@ -1847,7 +1881,16 @@ class ClawHubSource(SkillSource):
                     logger.debug("ClawHub ZIP download for %s v%s returned %s", slug, version, resp.status_code)
                     return files
 
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                content = resp.content
+                if expected_sha256 is not None:
+                    actual_sha256 = hashlib.sha256(content).hexdigest()
+                    if actual_sha256 != expected_sha256:
+                        raise ValueError(
+                            f"Archive integrity check failed for {slug} v{version}: "
+                            f"expected {expected_sha256}, got {actual_sha256}"
+                        )
+
+                with zipfile.ZipFile(io.BytesIO(content)) as zf:
                     for info in zf.infolist():
                         if info.is_dir():
                             continue
