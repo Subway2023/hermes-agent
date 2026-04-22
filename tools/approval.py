@@ -76,11 +76,11 @@ _SENSITIVE_WRITE_TARGET = (
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
-    (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
+    (r'\brm\s+--recur[a-z]*\b', "recursive delete (long flag)"),
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
-    (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
+    (r'\bchmod\s+--recur[a-z]*\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
     (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
-    (r'\bchown\s+--recursive\b.*root', "recursive chown to root (long flag)"),
+    (r'\bchown\s+--recur[a-z]*\b.*root', "recursive chown to root (long flag)"),
     (r'\bmkfs\b', "format filesystem"),
     (r'\bdd\s+.*if=', "disk copy"),
     (r'>\s*/dev/sd', "write to block device"),
@@ -121,14 +121,14 @@ DANGEROUS_PATTERNS = [
     # File copy/move/edit into sensitive system paths
     (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
     (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
-    (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    (r'\bsed\s+--in-plac[a-z]*\b.*\s/etc/', "in-place edit of system config (long flag)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
     # `python3 << 'EOF'` feeds arbitrary code via stdin without -c/-e flags.
     (r'\b(python[23]?|perl|ruby|node)\s+<<', "script execution via heredoc"),
     # Git destructive operations that can lose uncommitted work or rewrite
     # shared history. Not captured by rm/chmod/etc patterns.
     (r'\bgit\s+reset\s+--hard\b', "git reset --hard (destroys uncommitted changes)"),
-    (r'\bgit\s+push\b.*--force\b', "git force push (rewrites remote history)"),
+    (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
     (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
