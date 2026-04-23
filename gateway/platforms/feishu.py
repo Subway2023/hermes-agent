@@ -2445,7 +2445,10 @@ class FeishuAdapter(BasePlatformAdapter):
         """Route Feishu interactive card button clicks as synthetic COMMAND events."""
         event = getattr(data, "event", None)
         token = str(getattr(event, "token", "") or "")
-        if token and self._is_card_action_duplicate(token):
+        if not token:
+            logger.debug("[Feishu] Dropping card action with missing token")
+            return
+        if self._is_card_action_duplicate(token):
             logger.debug("[Feishu] Dropping duplicate card action token: %s", token)
             return
 
@@ -2947,8 +2950,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._record_webhook_anomaly(remote_ip, "401-token")
                 return web.Response(status=401, text="Invalid verification token")
 
-        # Timing-safe signature verification (only enforced when encrypt_key is set).
-        if self._encrypt_key and not self._is_webhook_signature_valid(request.headers, body_bytes):
+        # Timing-safe signature verification (fail-closed: rejected when encrypt_key is missing).
+        if not self._is_webhook_signature_valid(request.headers, body_bytes):
             logger.warning("[Feishu] Webhook rejected: invalid signature from %s", remote_ip)
             self._record_webhook_anomaly(remote_ip, "401-sig")
             return web.Response(status=401, text="Invalid signature")
@@ -2987,6 +2990,8 @@ class FeishuAdapter(BasePlatformAdapter):
             SHA256(timestamp + nonce + encrypt_key + body_string)
         Headers checked: x-lark-request-timestamp, x-lark-request-nonce, x-lark-signature.
         """
+        if not self._encrypt_key:
+            return False
         timestamp = str(headers.get("x-lark-request-timestamp", "") or "")
         nonce = str(headers.get("x-lark-request-nonce", "") or "")
         signature = str(headers.get("x-lark-signature", "") or "")

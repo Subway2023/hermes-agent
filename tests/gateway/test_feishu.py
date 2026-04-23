@@ -1473,8 +1473,9 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(submit.called)
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, {"FEISHU_ENCRYPT_KEY": "test_secret"}, clear=True)
     def test_webhook_request_uses_same_message_dispatch_path(self):
+        import hashlib
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -1485,10 +1486,13 @@ class TestAdapterBehavior(unittest.TestCase):
             "header": {"event_type": "im.message.receive_v1"},
             "event": {"message": {"message_id": "om_test"}},
         }).encode("utf-8")
+        timestamp, nonce, encrypt_key = "1700000000", "testnonce", "test_secret"
+        content = f"{timestamp}{nonce}{encrypt_key}" + body.decode("utf-8")
+        sig = hashlib.sha256(content.encode("utf-8")).hexdigest()
         request = SimpleNamespace(
             remote="127.0.0.1",
             content_length=None,
-            headers={},
+            headers={"x-lark-request-timestamp": timestamp, "x-lark-request-nonce": nonce, "x-lark-signature": sig},
             read=AsyncMock(return_value=body),
         )
 
@@ -3063,6 +3067,93 @@ class TestWebhookSecurity(unittest.TestCase):
         response = asyncio.run(adapter._handle_webhook_request(request))
         self.assertEqual(response.status, 200)
         self.assertIn(b"test_challenge_token", response.body)
+
+class TestCardActionSecurity(unittest.TestCase):
+    """Tests for card-action token validation: empty token must be rejected (fail-closed)."""
+
+    def _make_adapter(self) -> "FeishuAdapter":
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec"}, clear=True):
+            return FeishuAdapter(PlatformConfig())
+
+    def test_card_action_empty_token_dropped(self):
+        """Card actions with an empty token must be silently dropped (fail-closed)."""
+        adapter = self._make_adapter()
+        adapter._dispatch_inbound_event = AsyncMock()
+        event = SimpleNamespace(token="", context=None, operator=None, action=None)
+        data = SimpleNamespace(event=event)
+        asyncio.run(adapter._handle_card_action_event(data))
+        adapter._dispatch_inbound_event.assert_not_awaited()
+
+    def test_card_action_missing_token_attribute_dropped(self):
+        """Card actions where the token attribute is absent must also be dropped."""
+        adapter = self._make_adapter()
+        adapter._dispatch_inbound_event = AsyncMock()
+        # event has no 'token' attribute at all
+        event = SimpleNamespace(context=None, operator=None, action=None)
+        data = SimpleNamespace(event=event)
+        asyncio.run(adapter._handle_card_action_event(data))
+        adapter._dispatch_inbound_event.assert_not_awaited()
+
+    def test_card_action_valid_token_not_dropped(self):
+        """Card actions with a non-empty token must proceed past the token guard."""
+        adapter = self._make_adapter()
+        # Stub out downstream calls so the test stays focused on the guard.
+        adapter._is_card_action_duplicate = Mock(return_value=False)
+        adapter._dispatch_inbound_event = AsyncMock()
+        context = SimpleNamespace(open_chat_id="oc_chat")
+        operator = SimpleNamespace(open_id="ou_user")
+        action = SimpleNamespace(tag="button", value={"cmd": "hello"})
+        event = SimpleNamespace(token="tok_valid", context=context, operator=operator, action=action)
+        data = SimpleNamespace(event=event)
+        # We only assert the token guard was passed; downstream may still exit early.
+        asyncio.run(adapter._handle_card_action_event(data))
+        adapter._is_card_action_duplicate.assert_called_once_with("tok_valid")
+
+
+class TestWebhookFailClosed(unittest.TestCase):
+    """Tests for webhook signature validation: missing encrypt_key must fail-closed."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    def _make_adapter(self, encrypt_key: str = ""):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with patch.dict(os.environ, {"FEISHU_APP_ID": "cli", "FEISHU_APP_SECRET": "sec", "FEISHU_ENCRYPT_KEY": encrypt_key}, clear=True):
+            return FeishuAdapter(PlatformConfig())
+
+    def test_signature_missing_encrypt_key_rejected(self):
+        """_is_webhook_signature_valid returns False when encrypt_key is empty (fail-closed)."""
+        import hashlib
+
+        adapter = self._make_adapter("")
+        body = b'{"type":"event"}'
+        timestamp = "1700000000"
+        nonce = "abc123"
+        # Attacker computes HMAC using an empty key — must still be rejected.
+        content = f"{timestamp}{nonce}" + body.decode("utf-8")
+        sig = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        headers = {"x-lark-request-timestamp": timestamp, "x-lark-request-nonce": nonce, "x-lark-signature": sig}
+        self.assertFalse(adapter._is_webhook_signature_valid(headers, body))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_webhook_request_rejects_when_encrypt_key_not_configured(self):
+        """Non-challenge webhook requests must be rejected with 401 when encrypt_key is absent."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        body = json.dumps({"header": {"event_type": "im.message.receive_v1"}}).encode()
+        request = SimpleNamespace(
+            remote="127.0.0.1",
+            content_length=None,
+            headers={},
+            read=AsyncMock(return_value=body),
+        )
+        response = asyncio.run(adapter._handle_webhook_request(request))
+        self.assertEqual(response.status, 401)
 
 
 class TestDedupTTL(unittest.TestCase):
